@@ -4,7 +4,7 @@ neo is a fuzzy finder inspired by fnf and supports basic colours.
 # Usage
 ```
 cat file | neo
-echo "choice1\nchoice2\nchoice3" | neo
+echo -e "choice1\nchoice2\nchoice3" | neo
 ```
 
 # Dependencies
