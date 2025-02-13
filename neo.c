@@ -147,7 +147,6 @@ int main(void)
 	/* Read from stdin (pipe) */
 	char buf[MAX_LINE];
 	while (count < MAX_LINES && fgets(buf, sizeof(buf), stdin)) {
-		printf("buf: %s\n", buf);
 		size_t len = strlen(buf);
 		if (len && buf[len - 1] == '\n') buf[len - 1] = '\0';
 		lines[count++] = strdup(buf);
