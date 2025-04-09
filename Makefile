@@ -30,5 +30,6 @@ uninstall:
 clean:
 	$(RM) $(TARGET) *.o
 
+all: $(TARGET)
 
 .PHONY: all dist install uninstall clean
