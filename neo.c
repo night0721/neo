@@ -10,20 +10,46 @@
 
 #define MAX_LINES 10000
 #define MAX_LINE 4096
-#define RESET "\033[0m"
-#define RED "\033[31m"
-#define GREEN "\033[32m"
-#define YELLOW "\033[33m"
-#define BLUE "\033[34m"
 
-char **lines;
-int count;
-int selected;
-char query[MAX_LINE];
-int query_len;
-struct termios orig_termios;
-int rows = 24, cols = 80;
-int tty_fd;
+#define RESET  "\033[0m"
+#define RED    "\033[38;2;243;139;168m"
+#define GREEN  "\033[38;2;116;199;236m"
+#define WHITE  "\033[37m"
+#define ORANGE "\033[38;2;250;179;135m"
+
+typedef struct {
+	int index;
+	int score;
+	int pos[64];
+	int pos_count;
+} match;
+
+struct engine {
+	char **lines;
+	int line_count;
+
+	match *matches;
+	int match_count;
+
+	char query[MAX_LINE];
+	int query_len;
+
+	int selected;
+};
+
+static struct termios orig_termios;
+static int rows = 24;
+static int cols = 80;
+static int tty_fd;
+
+
+void cleanup(int sig)
+{
+	(void)sig;
+	printf("\033[?1049l\033[?25h");
+	tcsetattr(tty_fd, TCSAFLUSH, &orig_termios);
+	exit(1);
+}
 
 void get_window_size(void)
 {
@@ -36,134 +62,181 @@ void get_window_size(void)
 
 void handle_sigwinch(int sig)
 {
+	(void)sig;
 	get_window_size();
 }
 
-int fuzzy_match(const char *pattern, const char *str)
-{
-	if (!*pattern) return 1;
+/* Scoring function */
+#define SCORE_MATCH     10
+#define SCORE_CONSEC    15
+#define SCORE_BOUNDARY  8
+#define SCORE_GAP       -1
 
-	while (*str) {
-		if (tolower(*pattern) == tolower(*str)) {
-			const char *p = pattern + 1;
-			const char *s = str + 1;
-			while (*p && *s) {
-				if (tolower(*p) == tolower(*s)) p++;
-				s++;
-			}
-			if (!*p) return 1;
-		}
-		str++;
-	}
+static int is_boundary(char prev, char curr)
+{
+	if (prev == '/' || prev == '_' || prev == '-' || prev == ' ')
+		return 1;
+	if (islower(prev) && isupper(curr))
+		return 1;
 	return 0;
 }
 
-void highlight_matches(const char *str, const char *pattern, int selected)
+int fuzzy_score(const char *text, const char *pattern, int *pos, int *pos_count)
 {
-	if (!*pattern) {
-		printf("%s" RESET, str);
-		return;
+	int score = 0;
+	int last = -1;
+	*pos_count = 0;
+
+	for (int pi = 0; pattern[pi]; pi++) {
+		char p = tolower(pattern[pi]);
+		int found = 0;
+
+		for (int ti = last + 1; text[ti]; ti++) {
+			if (tolower(text[ti]) == p) {
+				score += SCORE_MATCH;	
+
+				if (ti == last + 1)
+					score += SCORE_CONSEC;
+
+				if (ti == 0 || is_boundary(text[ti - 1], text[ti]))
+					score += SCORE_BOUNDARY;
+
+				if (*pos_count < 64)
+					pos[(*pos_count)++] = ti;
+
+				last = ti;
+				found = 1;
+				break;
+			}
+			score += SCORE_GAP;
+		}
+
+		if (!found)
+			return -1;
 	}
 
-	const char *s = str;
-	const char *p = pattern;
+	return score;
+}
 
-	while (*s) {
-		if (p && tolower(*p) == tolower(*s)) {
-			printf(YELLOW "%c" RESET, *s);
-			p++;
+int match_cmp(const void *a, const void *b)
+{
+	const match *ma = a;
+	const match *mb = b;
+
+	if (ma->score != mb->score)
+		return mb->score - ma->score;
+
+	return ma->index - mb->index;
+}
+
+void engine_update(struct engine *e)
+{
+	e->match_count = 0;
+
+	for (int i = 0; i < e->line_count; i++) {
+		int s = fuzzy_score(e->lines[i], e->query,
+				e->matches[e->match_count].pos,
+				&e->matches[e->match_count].pos_count);
+		if (s >= 0) {
+			e->matches[e->match_count].index = i;
+			e->matches[e->match_count].score = s;
+			e->match_count++;
+		}
+	}
+
+	qsort(e->matches, e->match_count, sizeof(match), match_cmp);
+
+	if (e->selected >= e->match_count)
+		e->selected = e->match_count - 1;
+	if (e->selected < 0)
+		e->selected = 0;
+}
+
+void draw_highlight(const char *text, match *m, int max_cols, int selected)
+{
+	int pi = 0;
+	int col = 0;
+
+	for (int i = 0; text[i] && col < max_cols; i++) {
+		if (pi < m->pos_count && m->pos[pi] == i) {
+			if (selected)
+				printf("\033[1m" ORANGE "%c" RESET "\033[22m", text[i]);
+			else
+				printf(ORANGE "%c" RESET, text[i]);
+			pi++;
 		} else {
-			printf("%s%c", selected ? BLUE: RESET, *s);
+			putchar(text[i]);
 		}
-		s++;
+		col++;
 	}
 }
 
-int count_matches(void)
+void draw(struct engine *e)
 {
-	int matches = 0;
-	for (int i = 0; i < count; i++) {
-		if (fuzzy_match(query, lines[i])) matches++;
+	printf("\033[H\033[J");
+	printf(GREEN "> " RESET "%s\n", e->query);
+
+	int text_cols = cols - 2;
+	if (text_cols < 0)
+		text_cols = 0;
+
+	int visible = rows - 2;
+	int start = 0;
+
+	if (e->selected >= visible)
+		start = e->selected - visible + 1;
+
+	for (int i = start; i < e->match_count && i < start + visible; i++) {
+		int idx = e->matches[i].index;
+
+		/* clear line */
+		printf("\033[K");
+
+		if (i == e->selected)
+			printf(RED "> " RESET WHITE);
+		else
+			printf("  ");
+
+		draw_highlight(e->lines[idx], &e->matches[i], text_cols, i == e->selected);
+		putchar('\n');
 	}
-	return matches;
-}
 
-void draw(void)
-{
-	printf("\033[H\033[J" GREEN "> " RESET "%s\n", query);
-
-	/* 1 for prompt, 1 off by one */
-	int visible_items = rows - 2;
-
-    int start = 0;
-    int end = count;
-
-    if (selected >= visible_items) {
-        start = selected - visible_items + 1;
-    }
-    
-    if (end > start + visible_items) {
-        end = start + visible_items;
-    }
-
-	for (int i = start; i < end; i++) {
-		if (fuzzy_match(query, lines[i])) {
-			if (i == selected) {
-				printf(RED "> " RESET BLUE);
-			}
-			if (i != selected) {
-				printf("  ");
-			}
-			highlight_matches(lines[i], query, i == selected);
-			printf("\n");
-		}
-	}
-	/* Move cursor to query */
-	printf("\033[%d;%dH", 1, query_len + 3);
+	printf("\033[1;%dH", e->query_len + 3);
 	fflush(stdout);
 }
 
 int main(void)
 {
-	/* stdin already occupied by pipe, so we need /dev/tty */
+	printf("\033[?1049h\033[?25l");
+	signal(SIGINT, cleanup);
+	signal(SIGTERM, cleanup);
+	signal(SIGQUIT, cleanup);
 	tty_fd = open("/dev/tty", O_RDWR);
-	if (tty_fd == -1) {
-		perror("open");
+	if (tty_fd == -1)
 		return 1;
-	}
 
-	if (isatty(STDIN_FILENO)) {
-		fprintf(stderr, "neo: No input from pipe\n");
-		close(tty_fd);
+	if (isatty(STDIN_FILENO))
 		return 1;
-	}
 
-	lines = malloc(sizeof(char *) * MAX_LINES);
-	if (!lines) {
-		perror("malloc");
-		return 1;
-	}
+	char **lines = malloc(sizeof(char *) * MAX_LINES);
+	int count = 0;
 
-	/* Read from stdin (pipe) */
 	char buf[MAX_LINE];
 	while (count < MAX_LINES && fgets(buf, sizeof(buf), stdin)) {
 		size_t len = strlen(buf);
-		if (len && buf[len - 1] == '\n') buf[len - 1] = '\0';
+		if (len && buf[len - 1] == '\n')
+			buf[len - 1] = '\0';
 		lines[count++] = strdup(buf);
 	}
-	printf("count: %d\n", count);
 
-	if (!count) {
-		fprintf(stderr, "neo: No input received\n");
-		free(lines);
-		close(tty_fd);
-		return 1;
-	}
+	struct engine e = {0};
+	e.lines = lines;
+	e.line_count = count;
+	e.matches = malloc(sizeof(match) * count);
 
 	signal(SIGWINCH, handle_sigwinch);
 	get_window_size();
 
-	/* Raw mode */
 	tcgetattr(tty_fd, &orig_termios);
 	struct termios raw = orig_termios;
 	raw.c_iflag &= ~(ICRNL | IXON);
@@ -172,63 +245,54 @@ int main(void)
 	raw.c_cc[VTIME] = 0;
 	tcsetattr(tty_fd, TCSAFLUSH, &raw);
 
-	draw();
-	printf("\033[?25h");
+	engine_update(&e);
+	draw(&e);
 
 	while (1) {
 		char c;
-		if (read(tty_fd, &c, 1) == 1) {
-			if (c == 'q') break;
-			else if (c == 27) {
-				char seq[3];
-				if (read(tty_fd, &seq[0], 1) != 1) continue;
-				if (read(tty_fd, &seq[1], 1) != 1) continue;
+		if (read(tty_fd, &c, 1) != 1)
+			continue;
 
-				if (seq[0] == '[') {
-					switch (seq[1]) {
-						/* Up */
-						case 'A':
-							if (selected > 0) selected--;
-							break;
-						/* Down */
-						case 'B':
-							if (selected < count_matches() - 1)
-								selected++;
-							break;
-					}
-				}
-			} else if (c == 127 || c == '\b') {
-				if (query_len > 0) {
-					query_len--;
-					query[query_len] = '\0';
-					selected = 0;
-				}
-			} else if (c == '\r' || c == '\n') {
-				int matches = 0;
-				for (int i = 0; i < count; i++) {
-					if (fuzzy_match(query, lines[i])) {
-						if (matches == selected) {
-							printf("\033[H\033[J%s\n", lines[i]);
-							goto cleanup;
-						}
-						matches++;
-					}
-				}
-			} else if (query_len < sizeof(query) - 1 && isprint(c)) {
-				query[query_len++] = c;
-				query[query_len] = '\0';
-				selected = 0;
+		if (c == 27) {
+			char seq[2];
+			if (read(tty_fd, &seq[0], 1) != 1) continue;
+			if (read(tty_fd, &seq[1], 1) != 1) continue;
+
+			if (seq[0] == '[') {
+				if (seq[1] == 'A' && e.selected > 0)
+					e.selected--;
+				if (seq[1] == 'B' && e.selected + 1 < e.match_count)
+					e.selected++;
 			}
-
-			draw();
+		} else if (c == 127 || c == '\b') {
+			if (e.query_len > 0) {
+				e.query[--e.query_len] = '\0';
+				e.selected = 0;
+				engine_update(&e);
+			}
+		} else if (c == '\n' || c == '\r') {
+			if (e.match_count > 0) {
+				int idx = e.matches[e.selected].index;
+				printf("\033[?1049l\033[?25h");
+				printf("\033[H\033[J%s\n", e.lines[idx]);
+				break;
+			}
+		} else if (isprint(c) && e.query_len < MAX_LINE - 1) {
+			e.query[e.query_len++] = c;
+			e.query[e.query_len] = '\0';
+			e.selected = 0;
+			engine_update(&e);
 		}
+
+		draw(&e);
 	}
 
-cleanup:
 	tcsetattr(tty_fd, TCSAFLUSH, &orig_termios);
 	close(tty_fd);
+
 	for (int i = 0; i < count; i++)
 		free(lines[i]);
 	free(lines);
+	free(e.matches);
 	return 0;
 }
