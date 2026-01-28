@@ -1,15 +1,15 @@
 #include <ctype.h>
 #include <fcntl.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
+#include <signal.h>
 
-#define MAX_LINES 10000
-#define MAX_LINE 4096
+#define MAX_LINES 100000
+#define MAX_LEN 4096
 
 #define RESET  "\033[0m"
 #define RED    "\033[38;2;243;139;168m"
@@ -18,281 +18,147 @@
 #define ORANGE "\033[38;2;250;179;135m"
 
 typedef struct {
-	int index;
-	int score;
-	int pos[64];
-	int pos_count;
-} match;
+	int idx, score, pos[128];
+} match_t;
 
-struct engine {
+struct {
 	char **lines;
-	int line_count;
-
-	match *matches;
-	int match_count;
-
-	char query[MAX_LINE];
-	int query_len;
-
-	int selected;
-};
-
-static struct termios orig_termios;
-static int rows = 24;
-static int cols = 80;
-static int tty_fd;
-
+	match_t *matches;
+	char query[MAX_LEN];
+	int nlines, nmatches, qlen, sel, rows, cols, tty_fd;
+	struct termios orig;
+} e;
 
 void cleanup(int sig)
 {
 	(void)sig;
-	printf("\033[?1049l\033[?25h");
-	tcsetattr(tty_fd, TCSAFLUSH, &orig_termios);
-	exit(1);
-}
-
-void get_window_size(void)
-{
-	struct winsize ws;
-	if (ioctl(tty_fd, TIOCGWINSZ, &ws) != -1) {
-		rows = ws.ws_row;
-		cols = ws.ws_col;
+	write(e.tty_fd, "\033[?25h\033[?7h\033[2J\033[H", 15);
+	tcsetattr(e.tty_fd, TCSAFLUSH, &e.orig);
+	if (sig == 0) {
+		return;
 	}
+	exit(sig ? 1 : 0);
 }
 
-void handle_sigwinch(int sig)
+/*
+ * Fuzzy match scoring function
+ */
+int fzy_score(const char *n, const char *h, int *pos)
 {
-	(void)sig;
-	get_window_size();
-}
-
-/* Scoring function */
-#define SCORE_MATCH     10
-#define SCORE_CONSEC    15
-#define SCORE_BOUNDARY  8
-#define SCORE_GAP       -1
-
-static int is_boundary(char prev, char curr)
-{
-	if (prev == '/' || prev == '_' || prev == '-' || prev == ' ')
-		return 1;
-	if (islower(prev) && isupper(curr))
-		return 1;
-	return 0;
-}
-
-int fuzzy_score(const char *text, const char *pattern, int *pos, int *pos_count)
-{
-	int score = 0;
-	int last = -1;
-	*pos_count = 0;
-
-	for (int pi = 0; pattern[pi]; pi++) {
-		char p = tolower(pattern[pi]);
-		int found = 0;
-
-		for (int ti = last + 1; text[ti]; ti++) {
-			if (tolower(text[ti]) == p) {
-				score += SCORE_MATCH;	
-
-				if (ti == last + 1)
-					score += SCORE_CONSEC;
-
-				if (ti == 0 || is_boundary(text[ti - 1], text[ti]))
-					score += SCORE_BOUNDARY;
-
-				if (*pos_count < 64)
-					pos[(*pos_count)++] = ti;
-
-				last = ti;
-				found = 1;
-				break;
-			}
-			score += SCORE_GAP;
+	int ni = 0, hi = 0, score = 0, last_hi = -1;
+	int nlen = strlen(n), hlen = strlen(h);
+	while (ni < nlen && hi < hlen) {
+		if (tolower(h[hi]) == tolower(n[ni])) {
+			int s = 10;
+			if (hi == 0 || strchr("/._- ", h[hi-1])) s += 30;
+			if (last_hi != -1 && hi == last_hi + 1) s += 50;
+			else if (last_hi != -1) s -= (hi - last_hi) * 2;
+			score += s;
+			pos[ni] = hi;
+			last_hi = hi;
+			ni++;
 		}
-
-		if (!found)
-			return -1;
+		hi++;
 	}
-
-	return score;
+	if (ni == nlen && nlen > 0) return score - pos[0];
+	return -1000000;
 }
 
-int match_cmp(const void *a, const void *b)
+int cmp_match(const void *a, const void *b)
 {
-	const match *ma = a;
-	const match *mb = b;
-
-	if (ma->score != mb->score)
-		return mb->score - ma->score;
-
-	return ma->index - mb->index;
+	return ((match_t *)b)->score - ((match_t *)a)->score;
 }
 
-void engine_update(struct engine *e)
+void update()
 {
-	e->match_count = 0;
-
-	for (int i = 0; i < e->line_count; i++) {
-		int s = fuzzy_score(e->lines[i], e->query,
-				e->matches[e->match_count].pos,
-				&e->matches[e->match_count].pos_count);
-		if (s >= 0) {
-			e->matches[e->match_count].index = i;
-			e->matches[e->match_count].score = s;
-			e->match_count++;
+	e.nmatches = 0;
+	for (int i = 0; i < e.nlines; i++) {
+		int p[128], s = (e.qlen == 0) ? 0 : fzy_score(e.query, e.lines[i], p);
+		if (s > -1000000) {
+			e.matches[e.nmatches].idx = i;
+			e.matches[e.nmatches].score = s;
+			if (e.qlen > 0) memcpy(e.matches[e.nmatches].pos, p, sizeof(int) * (e.qlen < 128 ? e.qlen : 128));
+			e.nmatches++;
 		}
 	}
-
-	qsort(e->matches, e->match_count, sizeof(match), match_cmp);
-
-	if (e->selected >= e->match_count)
-		e->selected = e->match_count - 1;
-	if (e->selected < 0)
-		e->selected = 0;
+	if (e.qlen > 0) qsort(e.matches, e.nmatches, sizeof(match_t), cmp_match);
 }
 
-void draw_highlight(const char *text, match *m, int max_cols, int selected)
+void draw()
 {
-	int pi = 0;
-	int col = 0;
-
-	for (int i = 0; text[i] && col < max_cols; i++) {
-		if (pi < m->pos_count && m->pos[pi] == i) {
-			if (selected)
-				printf("\033[1m" ORANGE "%c" RESET "\033[22m", text[i]);
-			else
-				printf(ORANGE "%c" RESET, text[i]);
-			pi++;
-		} else {
-			putchar(text[i]);
-		}
-		col++;
-	}
-}
-
-void draw(struct engine *e)
-{
-	printf("\033[H\033[J");
-	printf(GREEN "> " RESET "%s\n", e->query);
-
-	int text_cols = cols - 2;
-	if (text_cols < 0)
-		text_cols = 0;
-
-	int visible = rows - 2;
+	char buf[65536];
+	int n = 0, vis_rows = e.rows - 2; /* 1 for query, 1 for padding/status */
 	int start = 0;
 
-	if (e->selected >= visible)
-		start = e->selected - visible + 1;
+	/* Simple scrolling: keep selection in view */
+	if (e.sel >= vis_rows) start = e.sel - vis_rows + 1;
 
-	for (int i = start; i < e->match_count && i < start + visible; i++) {
-		int idx = e->matches[i].index;
+	/* Clear and draw prompt */
+	n += sprintf(buf + n, "\033[H\033[J\033[?7l\033[?25l" GREEN ">" RESET " %s\r\n", e.query);
 
-		/* clear line */
-		printf("\033[K");
+	for (int i = start; i < start + vis_rows && i < e.nmatches; i++) {
+		match_t *m = &e.matches[i];
+		char *l = e.lines[m->idx];
+		n += sprintf(buf + n, "%s", (i == e.sel) ? RED ">" RESET " " : "  ");
 
-		if (i == e->selected)
-			printf(RED "> " RESET WHITE);
-		else
-			printf("  ");
-
-		draw_highlight(e->lines[idx], &e->matches[i], text_cols, i == e->selected);
-		putchar('\n');
+		int pi = 0;
+		for (int j = 0; l[j] && j < e.cols - 5; j++) {
+			if (e.qlen > 0 && pi < e.qlen && m->pos[pi] == j) {
+				n += sprintf(buf + n, ORANGE "%c" RESET, l[j]);
+				pi++;
+			} else buf[n++] = l[j];
+		}
+		n += sprintf(buf + n, "\033[K\r\n");
 	}
-
-	printf("\033[1;%dH", e->query_len + 3);
-	fflush(stdout);
+	/* Fix cursor pos: always on the first line */
+	n += sprintf(buf + n, "\033[1;%dH\033[?25h", e.qlen + 3);
+	write(e.tty_fd, buf, n);
 }
 
-int main(void)
+int main()
 {
-	printf("\033[?1049h\033[?25l");
-	signal(SIGINT, cleanup);
-	signal(SIGTERM, cleanup);
-	signal(SIGQUIT, cleanup);
-	tty_fd = open("/dev/tty", O_RDWR);
-	if (tty_fd == -1)
-		return 1;
-
-	if (isatty(STDIN_FILENO))
-		return 1;
-
-	char **lines = malloc(sizeof(char *) * MAX_LINES);
-	int count = 0;
-
-	char buf[MAX_LINE];
-	while (count < MAX_LINES && fgets(buf, sizeof(buf), stdin)) {
-		size_t len = strlen(buf);
-		if (len && buf[len - 1] == '\n')
-			buf[len - 1] = '\0';
-		lines[count++] = strdup(buf);
+	char line[MAX_LEN];
+	e.lines = malloc(sizeof(char *) * MAX_LINES);
+	while (e.nlines < MAX_LINES && fgets(line, sizeof(line), stdin)) {
+		line[strcspn(line, "\n")] = 0;
+		e.lines[e.nlines++] = strdup(line);
 	}
 
-	struct engine e = {0};
-	e.lines = lines;
-	e.line_count = count;
-	e.matches = malloc(sizeof(match) * count);
-
-	signal(SIGWINCH, handle_sigwinch);
-	get_window_size();
-
-	tcgetattr(tty_fd, &orig_termios);
-	struct termios raw = orig_termios;
-	raw.c_iflag &= ~(ICRNL | IXON);
+	e.tty_fd = open("/dev/tty", O_RDWR);
+	tcgetattr(e.tty_fd, &e.orig);
+	struct termios raw = e.orig;
 	raw.c_lflag &= ~(ECHO | ICANON);
-	raw.c_cc[VMIN] = 1;
-	raw.c_cc[VTIME] = 0;
-	tcsetattr(tty_fd, TCSAFLUSH, &raw);
+	tcsetattr(e.tty_fd, TCSAFLUSH, &raw);
 
-	engine_update(&e);
-	draw(&e);
+	struct winsize ws;
+	ioctl(e.tty_fd, TIOCGWINSZ, &ws);
+	e.rows = ws.ws_row; e.cols = ws.ws_col;
+	e.matches = malloc(sizeof(match_t) * e.nlines);
 
-	while (1) {
-		char c;
-		if (read(tty_fd, &c, 1) != 1)
-			continue;
+	signal(SIGINT, cleanup);
+	update(); draw();
 
+	char c;
+	while (read(e.tty_fd, &c, 1) == 1) {
 		if (c == 27) {
 			char seq[2];
-			if (read(tty_fd, &seq[0], 1) != 1) continue;
-			if (read(tty_fd, &seq[1], 1) != 1) continue;
-
-			if (seq[0] == '[') {
-				if (seq[1] == 'A' && e.selected > 0)
-					e.selected--;
-				if (seq[1] == 'B' && e.selected + 1 < e.match_count)
-					e.selected++;
-			}
-		} else if (c == 127 || c == '\b') {
-			if (e.query_len > 0) {
-				e.query[--e.query_len] = '\0';
-				e.selected = 0;
-				engine_update(&e);
-			}
-		} else if (c == '\n' || c == '\r') {
-			if (e.match_count > 0) {
-				int idx = e.matches[e.selected].index;
-				printf("\033[?1049l\033[?25h");
-				printf("\033[H\033[J%s\n", e.lines[idx]);
-				break;
-			}
-		} else if (isprint(c) && e.query_len < MAX_LINE - 1) {
-			e.query[e.query_len++] = c;
-			e.query[e.query_len] = '\0';
-			e.selected = 0;
-			engine_update(&e);
+			if (read(e.tty_fd, seq, 2) < 2) continue;
+			if (seq[1] == 'A') { if (e.sel > 0) e.sel--; }
+			else if (seq[1] == 'B') { if (e.sel < e.nmatches - 1) e.sel++; }
+		} else if (c == 127 || c == 8) {
+			if (e.qlen > 0) e.query[--e.qlen] = 0;
+			e.sel = 0; update();
+		} else if (c == '\r' || c == '\n') {
+			char *res = (e.nmatches > 0) ? strdup(e.lines[e.matches[e.sel].idx]) : NULL;
+			cleanup(0);
+			if (res) printf("%s\n", res);
+			return 0;
+		} else if (isprint(c)) {
+			e.query[e.qlen++] = c;
+			e.sel = 0; update();
 		}
-
-		draw(&e);
+		draw();
 	}
-
-	tcsetattr(tty_fd, TCSAFLUSH, &orig_termios);
-	close(tty_fd);
-
-	for (int i = 0; i < count; i++)
-		free(lines[i]);
-	free(lines);
-	free(e.matches);
+	cleanup(0);
 	return 0;
 }
